@@ -165,10 +165,7 @@ class GoAExecutor:
         state = self.storage.read_node_state(graph.name, run.run_id, node_name)
         backend = get_backend(node.backend)
 
-        if state.session_id:
-            prompt = f"继续执行任务。上游节点 '{state.activated_by or 'N/A'}' 输出:\n{state.output or '(无)'}"
-        else:
-            prompt = node.skill
+        prompt = self._build_prompt(node, state)
 
         state.status = NodeStatus.RUNNING
         self.storage.write_node_state(graph.name, run.run_id, node_name, state)
@@ -205,6 +202,43 @@ class GoAExecutor:
         self._activate_transitions(graph, run, node_name, condition)
 
     # ------------------------------------------------------------------
+    # Prompt construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_prompt(node: "GraphNode", state: NodeState) -> str:
+        """Build the prompt sent to the backend.
+
+        Two cases:
+          - First invocation (no session_id): full skill text + upstream input
+          - Resume (has session_id): short activation prompt + upstream input
+        """
+        from goa.models import GraphNode  # deferred to avoid circular at module level
+
+        has_upstream = bool(state.input_data)
+        is_resume = bool(state.session_id)
+
+        if is_resume:
+            parts = [f"继续执行任务 (节点: {node.name})。"]
+            if has_upstream:
+                parts.append(
+                    f"上游节点 '{state.activated_by}' 传入数据:\n"
+                    f"---\n{state.input_data}\n---"
+                )
+            else:
+                parts.append("无新的上游数据。")
+            return "\n\n".join(parts)
+
+        parts = [node.skill]
+        if has_upstream:
+            parts.append(
+                f"\n\n## 上游输入\n"
+                f"激活方: {state.activated_by}\n"
+                f"传入数据:\n{state.input_data}"
+            )
+        return "".join(parts)
+
+    # ------------------------------------------------------------------
     # Transition activation
     # ------------------------------------------------------------------
 
@@ -227,13 +261,14 @@ class GoAExecutor:
 
             target_state.status = NodeStatus.PENDING
             target_state.activated_by = source_name
-            target_state.output = source_state.output
+            target_state.input_data = source_state.output
             self.storage.write_node_state(
                 graph.name, run.run_id, t.target, target_state
             )
             self.storage.append_log(
                 graph.name, run.run_id, t.target,
-                f"PENDING — activated by '{source_name}' (condition={condition})",
+                f"PENDING — activated by '{source_name}' (condition={condition})"
+                f" | input_data={len(source_state.output)} chars",
             )
 
     def _transitions_already_fired(

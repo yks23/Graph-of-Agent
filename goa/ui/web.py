@@ -167,6 +167,7 @@ class GoAHandler(BaseHTTPRequestHandler):
             nodes[n] = {
                 "status": s.status.value,
                 "activated_by": s.activated_by,
+                "input_data": s.input_data[:500] if s.input_data else "",
                 "output": s.output[:500],
                 "error": s.error,
                 "updated_at": s.updated_at,

@@ -90,6 +90,7 @@ class NodeState:
     status: NodeStatus = NodeStatus.IDLE
     session_id: str | None = None
     activated_by: str | None = None
+    input_data: str = ""
     output: str = ""
     error: str = ""
     updated_at: str = ""
