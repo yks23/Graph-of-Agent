@@ -1,21 +1,31 @@
-"""GoA execution engine — poll-based state machine."""
+"""GoA execution engine — poll-based state machine with inbox messaging."""
 
 from __future__ import annotations
 
 import logging
-import time
 import threading
 from datetime import datetime, timezone
 
 from goa.backends import get_backend
-from goa.models import Graph, GraphRun, NodeState, NodeStatus
+from goa.models import (
+    Graph,
+    GraphNode,
+    GraphRun,
+    InboxMessage,
+    NodeState,
+    NodeStatus,
+)
 from goa.storage import GoAStorage
 
 log = logging.getLogger(__name__)
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 class GoAExecutor:
-    """Drives graph execution by polling node state files."""
+    """Drives graph execution by polling node state files and inboxes."""
 
     def __init__(
         self,
@@ -31,12 +41,7 @@ class GoAExecutor:
     # ------------------------------------------------------------------
 
     def start(self, graph: Graph, *, blocking: bool = True) -> str:
-        """Start a graph run. Returns run_id.
-
-        If *blocking* is True (default), runs the poll loop in the current
-        thread until all nodes are settled.  If False, launches a background
-        thread and returns immediately.
-        """
+        """Start a graph run. Returns run_id."""
         errors = graph.validate()
         if errors:
             raise ValueError(f"Invalid graph: {'; '.join(errors)}")
@@ -47,13 +52,18 @@ class GoAExecutor:
             state = NodeState(status=NodeStatus.IDLE)
             self.storage.write_node_state(graph.name, run.run_id, node_name, state)
 
-        entry_state = NodeState(status=NodeStatus.PENDING)
-        self.storage.write_node_state(graph.name, run.run_id, graph.entry, entry_state)
+        self.storage.drop_inbox_message(
+            graph.name,
+            run.run_id,
+            graph.entry,
+            InboxMessage(
+                source="_system",
+                condition="start",
+                data="",
+                timestamp=_now(),
+            ),
+        )
 
-        run.node_states = {
-            n: self.storage.read_node_state(graph.name, run.run_id, n)
-            for n in graph.nodes
-        }
         self.storage.save_run(run)
 
         stop_event = threading.Event()
@@ -120,41 +130,70 @@ class GoAExecutor:
         self._stop_events.pop(key, None)
 
     def _poll_cycle(self, graph: Graph, run: GraphRun) -> bool:
-        """Execute one poll cycle. Returns True if there are still active nodes."""
-        pending_nodes: list[str] = []
-        has_running = False
+        """Single poll iteration.
 
+        Phase 1: consume inboxes → promote IDLE/DONE/ERROR nodes to PENDING
+        Phase 2: execute all PENDING nodes (serial)
+        Phase 3: determine if graph is still active
+        """
+        # Phase 1 — process inboxes
+        self._process_inboxes(graph, run)
+
+        # Phase 2 — execute PENDING nodes
         for node_name in graph.nodes:
             state = self.storage.read_node_state(graph.name, run.run_id, node_name)
             if state.status == NodeStatus.PENDING:
-                pending_nodes.append(node_name)
-            elif state.status == NodeStatus.RUNNING:
-                has_running = True
+                self._execute_node(graph, run, node_name)
 
-        for node_name in pending_nodes:
-            self._execute_node(graph, run, node_name)
-
-        still_active = False
+        # Phase 3 — still active?
         for node_name in graph.nodes:
             state = self.storage.read_node_state(graph.name, run.run_id, node_name)
             if state.status in (NodeStatus.PENDING, NodeStatus.RUNNING):
-                still_active = True
-                break
+                return True
+            if self.storage.read_inbox(graph.name, run.run_id, node_name):
+                return True
 
-            if state.status == NodeStatus.DONE:
-                has_outgoing = any(
-                    t for t in graph.nodes[node_name].transitions
-                    if t.condition == "done"
-                )
-                if has_outgoing:
-                    already_activated = self._transitions_already_fired(
-                        graph, run, node_name, "done"
-                    )
-                    if not already_activated:
-                        self._activate_transitions(graph, run, node_name, "done")
-                        still_active = True
+        return False
 
-        return still_active
+    # ------------------------------------------------------------------
+    # Inbox processing
+    # ------------------------------------------------------------------
+
+    def _process_inboxes(self, graph: Graph, run: GraphRun) -> None:
+        """For each node: if not RUNNING/PENDING and has inbox messages,
+        consume them and promote to PENDING."""
+        for node_name in graph.nodes:
+            state = self.storage.read_node_state(graph.name, run.run_id, node_name)
+            if state.status in (NodeStatus.RUNNING, NodeStatus.PENDING):
+                continue
+
+            messages = self.storage.read_inbox(graph.name, run.run_id, node_name)
+            if not messages:
+                continue
+
+            if len(messages) == 1:
+                msg = messages[0]
+                state.activated_by = msg.source
+                state.input_data = msg.data
+            else:
+                sources: list[str] = []
+                parts: list[str] = []
+                for msg in messages:
+                    sources.append(msg.source)
+                    if msg.data:
+                        parts.append(f"[From {msg.source} ({msg.condition})]:\n{msg.data}")
+                state.activated_by = ", ".join(sources)
+                state.input_data = "\n\n".join(parts)
+
+            state.status = NodeStatus.PENDING
+            self.storage.write_node_state(graph.name, run.run_id, node_name, state)
+            self.storage.clear_inbox(graph.name, run.run_id, node_name)
+
+            self.storage.append_log(
+                graph.name, run.run_id, node_name,
+                f"PENDING — inbox consumed: {len(messages)} msg(s) "
+                f"from [{state.activated_by}]",
+            )
 
     # ------------------------------------------------------------------
     # Node execution
@@ -179,7 +218,7 @@ class GoAExecutor:
 
         state.session_id = result.session_id or state.session_id
         state.output = result.output
-        state.updated_at = datetime.now(timezone.utc).isoformat()
+        state.updated_at = _now()
 
         if result.success:
             state.status = NodeStatus.DONE
@@ -199,22 +238,19 @@ class GoAExecutor:
         self.storage.write_node_state(graph.name, run.run_id, node_name, state)
 
         condition = "done" if result.success else "error"
-        self._activate_transitions(graph, run, node_name, condition)
+        self._send_transitions(graph, run, node_name, condition)
 
     # ------------------------------------------------------------------
     # Prompt construction
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_prompt(node: "GraphNode", state: NodeState) -> str:
+    def _build_prompt(node: GraphNode, state: NodeState) -> str:
         """Build the prompt sent to the backend.
 
-        Two cases:
-          - First invocation (no session_id): full skill text + upstream input
-          - Resume (has session_id): short activation prompt + upstream input
+        First invocation (no session_id): full skill + upstream input
+        Resume (has session_id): short activation prompt + upstream input
         """
-        from goa.models import GraphNode  # deferred to avoid circular at module level
-
         has_upstream = bool(state.input_data)
         is_resume = bool(state.session_id)
 
@@ -239,12 +275,13 @@ class GoAExecutor:
         return "".join(parts)
 
     # ------------------------------------------------------------------
-    # Transition activation
+    # Transition → drop messages into downstream inboxes
     # ------------------------------------------------------------------
 
-    def _activate_transitions(
+    def _send_transitions(
         self, graph: Graph, run: GraphRun, source_name: str, condition: str
     ) -> None:
+        """For each matching transition, drop a message into the target's inbox."""
         node = graph.nodes[source_name]
         source_state = self.storage.read_node_state(
             graph.name, run.run_id, source_name
@@ -253,35 +290,18 @@ class GoAExecutor:
         for t in node.transitions:
             if t.condition != condition:
                 continue
-            target_state = self.storage.read_node_state(
-                graph.name, run.run_id, t.target
-            )
-            if target_state.status in (NodeStatus.RUNNING, NodeStatus.PENDING):
-                continue
 
-            target_state.status = NodeStatus.PENDING
-            target_state.activated_by = source_name
-            target_state.input_data = source_state.output
-            self.storage.write_node_state(
-                graph.name, run.run_id, t.target, target_state
+            msg = InboxMessage(
+                source=source_name,
+                condition=condition,
+                data=source_state.output,
+                timestamp=_now(),
+            )
+            self.storage.drop_inbox_message(
+                graph.name, run.run_id, t.target, msg
             )
             self.storage.append_log(
                 graph.name, run.run_id, t.target,
-                f"PENDING — activated by '{source_name}' (condition={condition})"
-                f" | input_data={len(source_state.output)} chars",
+                f"INBOX ← message from '{source_name}' "
+                f"(condition={condition}, {len(source_state.output)} chars)",
             )
-
-    def _transitions_already_fired(
-        self, graph: Graph, run: GraphRun, source_name: str, condition: str
-    ) -> bool:
-        """Check if all downstream targets for this condition are already beyond IDLE."""
-        node = graph.nodes[source_name]
-        for t in node.transitions:
-            if t.condition != condition:
-                continue
-            target_state = self.storage.read_node_state(
-                graph.name, run.run_id, t.target
-            )
-            if target_state.status == NodeStatus.IDLE:
-                return False
-        return True

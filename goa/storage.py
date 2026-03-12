@@ -11,6 +11,7 @@ from goa.models import (
     Graph,
     GraphNode,
     GraphRun,
+    InboxMessage,
     NodeState,
     NodeStatus,
     Transition,
@@ -151,6 +152,60 @@ class GoAStorage:
         return path.read_text(encoding="utf-8")
 
     # ------------------------------------------------------------------
+    # Inbox (inter-node message passing)
+    # ------------------------------------------------------------------
+
+    def drop_inbox_message(
+        self, graph_name: str, run_id: str, target_node: str, msg: InboxMessage
+    ) -> None:
+        """Write a message file into target_node's inbox."""
+        inbox = self._inbox_dir(graph_name, run_id, target_node)
+        inbox.mkdir(parents=True, exist_ok=True)
+        safe_ts = msg.timestamp.replace(":", "-").replace("+", "_")
+        filename = f"{safe_ts}_{msg.source}.json"
+        (inbox / filename).write_text(
+            json.dumps(
+                {
+                    "source": msg.source,
+                    "condition": msg.condition,
+                    "data": msg.data,
+                    "timestamp": msg.timestamp,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    def read_inbox(
+        self, graph_name: str, run_id: str, node: str
+    ) -> list[InboxMessage]:
+        """Return all messages in a node's inbox, sorted by filename (≈ timestamp)."""
+        inbox = self._inbox_dir(graph_name, run_id, node)
+        if not inbox.exists():
+            return []
+        messages: list[InboxMessage] = []
+        for f in sorted(inbox.glob("*.json")):
+            d = json.loads(f.read_text(encoding="utf-8"))
+            messages.append(
+                InboxMessage(
+                    source=d["source"],
+                    condition=d["condition"],
+                    data=d["data"],
+                    timestamp=d["timestamp"],
+                )
+            )
+        return messages
+
+    def clear_inbox(self, graph_name: str, run_id: str, node: str) -> None:
+        """Remove all messages from a node's inbox."""
+        inbox = self._inbox_dir(graph_name, run_id, node)
+        if not inbox.exists():
+            return
+        for f in inbox.glob("*.json"):
+            f.unlink()
+
+    # ------------------------------------------------------------------
     # Internal path helpers
     # ------------------------------------------------------------------
 
@@ -162,6 +217,9 @@ class GoAStorage:
 
     def _logs_dir(self, graph_name: str, run_id: str) -> Path:
         return self._run_dir(graph_name, run_id) / "logs"
+
+    def _inbox_dir(self, graph_name: str, run_id: str, node: str) -> Path:
+        return self._run_dir(graph_name, run_id) / "inbox" / node
 
 
 # ======================================================================

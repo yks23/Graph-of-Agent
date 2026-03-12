@@ -108,6 +108,20 @@ class GraphRun:
 
 
 # ---------------------------------------------------------------------------
+# Inbox message (inter-node communication primitive)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class InboxMessage:
+    """A single message dropped into a node's inbox by an upstream node."""
+
+    source: str
+    condition: str
+    data: str
+    timestamp: str
+
+
+# ---------------------------------------------------------------------------
 # Backend result
 # ---------------------------------------------------------------------------
 

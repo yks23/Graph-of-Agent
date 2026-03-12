@@ -164,6 +164,7 @@ class GoAHandler(BaseHTTPRequestHandler):
         nodes = {}
         for n in node_names:
             s = self.storage.read_node_state(name, run_id, n)
+            inbox = self.storage.read_inbox(name, run_id, n)
             nodes[n] = {
                 "status": s.status.value,
                 "activated_by": s.activated_by,
@@ -171,6 +172,7 @@ class GoAHandler(BaseHTTPRequestHandler):
                 "output": s.output[:500],
                 "error": s.error,
                 "updated_at": s.updated_at,
+                "inbox_count": len(inbox),
             }
 
         self._json_response(200, {

@@ -111,6 +111,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     table.add_column("Node", style="cyan")
     table.add_column("Status")
     table.add_column("Activated By")
+    table.add_column("Inbox", justify="right")
     table.add_column("Updated")
 
     node_names = list(graph.nodes.keys()) if graph else []
@@ -126,11 +127,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     }
     for name in node_names:
         state = storage.read_node_state(args.name, run_id, name)
+        inbox = storage.read_inbox(args.name, run_id, name)
         style = status_styles.get(state.status.value, "")
+        inbox_str = f"[yellow]{len(inbox)}[/yellow]" if inbox else "0"
         table.add_row(
             name,
             f"[{style}]{state.status.value}[/{style}]",
             state.activated_by or "",
+            inbox_str,
             state.updated_at[:19] if state.updated_at else "",
         )
 

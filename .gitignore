@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 .goa/
 *.egg-info/
+.goa/

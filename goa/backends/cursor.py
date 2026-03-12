@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -17,6 +18,14 @@ class CursorBackend(AgentBackend):
     def name(self) -> str:
         return "cursor"
 
+    def _get_api_key(self) -> str | None:
+        """Resolve API key from standard env vars."""
+        key = os.environ.get("CURSOR_API_KEY", "")
+        if key:
+            return key
+        key = os.environ.get("cursor-api-key", "")
+        return key or None
+
     def execute(
         self,
         prompt: str,
@@ -24,15 +33,18 @@ class CursorBackend(AgentBackend):
         session_id: str | None = None,
     ) -> BackendResult:
         cmd = [
-            "cursor-agent",
-            "--print",
-            "--force",
-            "--trust",
+            "agent",
+            "-p", prompt,
             "--output-format", "stream-json",
+            "--trust",
         ]
+
+        api_key = self._get_api_key()
+        if api_key:
+            cmd.extend(["--api-key", api_key])
+
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.append(prompt)
 
         start = time.monotonic()
         try:
@@ -47,14 +59,14 @@ class CursorBackend(AgentBackend):
             return BackendResult(
                 success=False,
                 output="",
-                error="cursor-agent CLI not found. Is Cursor installed?",
+                error="agent CLI not found. Install via: curl https://cursor.com/install -fsS | bash",
                 duration_sec=time.monotonic() - start,
             )
         except subprocess.TimeoutExpired:
             return BackendResult(
                 success=False,
                 output="",
-                error="cursor-agent timed out after 600s",
+                error="agent timed out after 600s",
                 duration_sec=600.0,
             )
 
@@ -74,10 +86,22 @@ class CursorBackend(AgentBackend):
 
             if "session_id" in obj:
                 new_session_id = obj["session_id"]
-            if obj.get("type") == "assistant":
-                text_parts.append(obj.get("content", ""))
-            elif obj.get("type") == "result":
-                text_parts.append(obj.get("content", ""))
+
+            msg_type = obj.get("type", "")
+
+            if msg_type == "assistant":
+                content = obj.get("message", {}).get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block["text"])
+                elif isinstance(content, str) and content:
+                    text_parts.append(content)
+
+            elif msg_type == "result":
+                result_text = obj.get("result", "")
+                if result_text:
+                    text_parts.append(result_text)
 
         output = "\n".join(text_parts).strip()
 
@@ -100,8 +124,8 @@ class CursorBackend(AgentBackend):
 
     @classmethod
     def is_available(cls) -> bool:
-        return shutil.which("cursor-agent") is not None
+        return shutil.which("agent") is not None
 
     @classmethod
     def install_hint(cls) -> str:
-        return "Install Cursor IDE from https://cursor.com — the `cursor-agent` CLI ships with it."
+        return "Install: curl https://cursor.com/install -fsS | bash"
