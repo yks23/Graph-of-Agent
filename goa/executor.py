@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 from datetime import datetime, timezone
 
@@ -14,10 +16,13 @@ from goa.models import (
     InboxMessage,
     NodeState,
     NodeStatus,
+    Transition,
 )
 from goa.storage import GoAStorage
 
 log = logging.getLogger(__name__)
+
+GOA_CALL_FENCE = "GOA_CALL"
 
 
 def _now() -> str:
@@ -136,16 +141,13 @@ class GoAExecutor:
         Phase 2: execute all PENDING nodes (serial)
         Phase 3: determine if graph is still active
         """
-        # Phase 1 — process inboxes
         self._process_inboxes(graph, run)
 
-        # Phase 2 — execute PENDING nodes
         for node_name in graph.nodes:
             state = self.storage.read_node_state(graph.name, run.run_id, node_name)
             if state.status == NodeStatus.PENDING:
                 self._execute_node(graph, run, node_name)
 
-        # Phase 3 — still active?
         for node_name in graph.nodes:
             state = self.storage.read_node_state(graph.name, run.run_id, node_name)
             if state.status in (NodeStatus.PENDING, NodeStatus.RUNNING):
@@ -204,7 +206,7 @@ class GoAExecutor:
         state = self.storage.read_node_state(graph.name, run.run_id, node_name)
         backend = get_backend(node.backend)
 
-        prompt = self._build_prompt(node, state)
+        prompt = self._build_prompt(graph, run, node, state)
 
         state.status = NodeStatus.RUNNING
         self.storage.write_node_state(graph.name, run.run_id, node_name, state)
@@ -237,64 +239,248 @@ class GoAExecutor:
 
         self.storage.write_node_state(graph.name, run.run_id, node_name, state)
 
-        condition = "done" if result.success else "error"
-        self._send_transitions(graph, run, node_name, condition)
+        self._dispatch_transitions(graph, run, node, state, result.success)
 
     # ------------------------------------------------------------------
     # Prompt construction
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_prompt(node: GraphNode, state: NodeState) -> str:
-        """Build the prompt sent to the backend.
-
-        First invocation (no session_id): full skill + upstream input
-        Resume (has session_id): short activation prompt + upstream input
-        """
-        has_upstream = bool(state.input_data)
+    def _build_prompt(
+        self,
+        graph: Graph,
+        run: GraphRun,
+        node: GraphNode,
+        state: NodeState,
+    ) -> str:
+        """Build the full prompt for a node invocation."""
         is_resume = bool(state.session_id)
+        workspace = str(self.storage.root.parent)
 
         if is_resume:
-            parts = [f"继续执行任务 (节点: {node.name})。"]
-            if has_upstream:
-                parts.append(
-                    f"上游节点 '{state.activated_by}' 传入数据:\n"
-                    f"---\n{state.input_data}\n---"
-                )
-            else:
-                parts.append("无新的上游数据。")
-            return "\n\n".join(parts)
+            return self._build_resume_prompt(graph, node, state, workspace)
+        return self._build_first_prompt(graph, run, node, state, workspace)
 
-        parts = [node.skill]
-        if has_upstream:
-            parts.append(
-                f"\n\n## 上游输入\n"
-                f"激活方: {state.activated_by}\n"
-                f"传入数据:\n{state.input_data}"
-            )
-        return "".join(parts)
+    def _build_first_prompt(
+        self,
+        graph: Graph,
+        run: GraphRun,
+        node: GraphNode,
+        state: NodeState,
+        workspace: str,
+    ) -> str:
+        """First invocation: full context injection."""
+        sections: list[str] = []
 
-    # ------------------------------------------------------------------
-    # Transition → drop messages into downstream inboxes
-    # ------------------------------------------------------------------
+        # ---- Section 1: Skill ----
+        sections.append(node.skill)
 
-    def _send_transitions(
-        self, graph: Graph, run: GraphRun, source_name: str, condition: str
-    ) -> None:
-        """For each matching transition, drop a message into the target's inbox."""
-        node = graph.nodes[source_name]
-        source_state = self.storage.read_node_state(
-            graph.name, run.run_id, source_name
+        # ---- Section 2: Workspace ----
+        sections.append(
+            f"## Workspace\n"
+            f"- Working directory: {workspace}\n"
+            f"- GoA data directory: {workspace}/.goa/\n"
+            f"- Graph: {graph.name}\n"
+            f"- Run ID: {run.run_id}\n"
+            f"- Node: {node.name} (backend: {node.backend})"
         )
+
+        # ---- Section 3: Workflow ----
+        workflow_lines = [f"## Workflow"]
+        workflow_lines.append(f"Graph \"{graph.name}\": {graph.description}")
+        workflow_lines.append(f"Entry node: {graph.entry}")
+        workflow_lines.append("")
+        workflow_lines.append("Nodes in this graph:")
+        for n_name, n in graph.nodes.items():
+            marker = " ← YOU" if n_name == node.name else ""
+            workflow_lines.append(
+                f"  [{n_name}] ({n.backend}) — {n.description or n.skill[:60]}{marker}"
+            )
+            for t in n.transitions:
+                workflow_lines.append(f"    ──{t.condition}──> {t.target}")
+        sections.append("\n".join(workflow_lines))
+
+        # ---- Section 4: Upstream input ----
+        if state.input_data:
+            sections.append(
+                f"## Upstream Input\n"
+                f"Activated by: {state.activated_by}\n"
+                f"Data:\n{state.input_data}"
+            )
+
+        # ---- Section 5: Call mechanism ----
+        sections.append(self._build_call_section(node))
+
+        # ---- Section 6: Constraints ----
+        sections.append(
+            "## Constraints\n"
+            "- Stay focused on your Skill described above. Do not take on work "
+            "assigned to other nodes.\n"
+            "- When your task is complete, you MUST emit a GOA_CALL block "
+            "(see Call section) so the next node can be activated.\n"
+            "- If you cannot complete the task, emit a GOA_CALL with "
+            "condition=\"error\" to trigger the error path.\n"
+            "- Do NOT attempt to run or modify the GoA framework itself.\n"
+            "- Your working directory is the project workspace, not the .goa/ "
+            "data directory."
+        )
+
+        return "\n\n".join(sections)
+
+    def _build_resume_prompt(
+        self,
+        graph: Graph,
+        node: GraphNode,
+        state: NodeState,
+        workspace: str,
+    ) -> str:
+        """Resume invocation: short activation with upstream data."""
+        parts: list[str] = []
+        parts.append(
+            f"You are being re-activated as node \"{node.name}\" in graph "
+            f"\"{graph.name}\" (workspace: {workspace})."
+        )
+
+        if state.input_data:
+            parts.append(
+                f"## Upstream Input\n"
+                f"Activated by: {state.activated_by}\n"
+                f"Data:\n{state.input_data}"
+            )
+
+        parts.append(self._build_call_section(node))
+
+        parts.append(
+            "## Constraints\n"
+            "- Continue from where you left off.\n"
+            "- When done, emit a GOA_CALL block to activate the next node."
+        )
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _build_call_section(node: GraphNode) -> str:
+        """Build the Call section that teaches the agent how to signal transitions."""
+        lines = [
+            "## Call",
+            "When you are done, you MUST output a fenced block to signal which "
+            "node(s) to activate next. Format:",
+            "",
+            "```GOA_CALL",
+            '[{"target": "<node_name>", "condition": "<done|error>", '
+            '"data": "<message to pass>"}]',
+            "```",
+            "",
+            "Rules:",
+            "- The block must be valid JSON: an array of objects.",
+            "- Each object needs: target (string), condition (string), "
+            "data (string).",
+            "- You may call multiple targets in one block.",
+            '- If your task succeeded, use condition="done".',
+            '- If your task failed, use condition="error".',
+            "- The data field is passed as input to the target node — include "
+            "a useful summary of your work.",
+            "- If you emit no GOA_CALL block, the executor falls back to "
+            "default transitions based on exit status.",
+            "",
+            "Your available transitions:",
+        ]
+
+        if node.transitions:
+            for t in node.transitions:
+                lines.append(f'  - target="{t.target}", condition="{t.condition}"')
+        else:
+            lines.append("  (none — you are a terminal node)")
+
+        lines.append("")
+        lines.append("Example:")
+        if node.transitions:
+            first = node.transitions[0]
+            lines.append("```GOA_CALL")
+            lines.append(json.dumps(
+                [{"target": first.target, "condition": first.condition,
+                  "data": "Task completed. Summary: ..."}],
+                ensure_ascii=False,
+            ))
+            lines.append("```")
+        else:
+            lines.append("```GOA_CALL")
+            lines.append("[]")
+            lines.append("```")
+
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Transition dispatch — parse GOA_CALL from output, fallback to default
+    # ------------------------------------------------------------------
+
+    def _dispatch_transitions(
+        self,
+        graph: Graph,
+        run: GraphRun,
+        node: GraphNode,
+        state: NodeState,
+        success: bool,
+    ) -> None:
+        """Parse GOA_CALL blocks from output. Fall back to default transitions."""
+        calls = _parse_goa_calls(state.output)
+
+        if calls:
+            valid_targets = {t.target for t in node.transitions}
+            for call in calls:
+                target = call.get("target", "")
+                condition = call.get("condition", "done")
+                data = call.get("data", state.output)
+
+                if target not in graph.nodes:
+                    self.storage.append_log(
+                        graph.name, run.run_id, node.name,
+                        f"CALL ignored: unknown target '{target}'",
+                    )
+                    continue
+
+                if target not in valid_targets:
+                    self.storage.append_log(
+                        graph.name, run.run_id, node.name,
+                        f"CALL warning: '{target}' not in declared transitions, "
+                        f"sending anyway",
+                    )
+
+                msg = InboxMessage(
+                    source=node.name,
+                    condition=condition,
+                    data=data,
+                    timestamp=_now(),
+                )
+                self.storage.drop_inbox_message(
+                    graph.name, run.run_id, target, msg
+                )
+                self.storage.append_log(
+                    graph.name, run.run_id, target,
+                    f"INBOX ← GOA_CALL from '{node.name}' "
+                    f"(condition={condition}, {len(data)} chars)",
+                )
+        else:
+            self._send_default_transitions(graph, run, node, state, success)
+
+    def _send_default_transitions(
+        self,
+        graph: Graph,
+        run: GraphRun,
+        node: GraphNode,
+        state: NodeState,
+        success: bool,
+    ) -> None:
+        """Fallback: fire transitions based on success/error condition matching."""
+        condition = "done" if success else "error"
 
         for t in node.transitions:
             if t.condition != condition:
                 continue
 
             msg = InboxMessage(
-                source=source_name,
+                source=node.name,
                 condition=condition,
-                data=source_state.output,
+                data=state.output,
                 timestamp=_now(),
             )
             self.storage.drop_inbox_message(
@@ -302,6 +488,43 @@ class GoAExecutor:
             )
             self.storage.append_log(
                 graph.name, run.run_id, t.target,
-                f"INBOX ← message from '{source_name}' "
-                f"(condition={condition}, {len(source_state.output)} chars)",
+                f"INBOX ← default transition from '{node.name}' "
+                f"(condition={condition}, {len(state.output)} chars)",
             )
+
+
+# ======================================================================
+# GOA_CALL parser
+# ======================================================================
+
+_GOA_CALL_PATTERN = re.compile(
+    r"```GOA_CALL\s*\n(.*?)\n\s*```",
+    re.DOTALL,
+)
+
+
+def _parse_goa_calls(output: str) -> list[dict]:
+    """Extract GOA_CALL JSON blocks from agent output.
+
+    Returns a list of call dicts, or empty list if none found.
+    """
+    matches = _GOA_CALL_PATTERN.findall(output)
+    if not matches:
+        return []
+
+    calls: list[dict] = []
+    for raw in matches:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("Failed to parse GOA_CALL block: %s", raw[:200])
+            continue
+        if isinstance(parsed, list):
+            calls.extend(parsed)
+        elif isinstance(parsed, dict):
+            calls.append(parsed)
+
+    return calls

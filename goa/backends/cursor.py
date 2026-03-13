@@ -72,7 +72,8 @@ class CursorBackend(AgentBackend):
 
         duration = time.monotonic() - start
         new_session_id = session_id
-        text_parts: list[str] = []
+        assistant_parts: list[str] = []
+        result_text: str = ""
 
         for line in proc.stdout.splitlines():
             line = line.strip()
@@ -81,7 +82,7 @@ class CursorBackend(AgentBackend):
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
-                text_parts.append(line)
+                assistant_parts.append(line)
                 continue
 
             if "session_id" in obj:
@@ -94,16 +95,14 @@ class CursorBackend(AgentBackend):
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
-                            text_parts.append(block["text"])
+                            assistant_parts.append(block["text"])
                 elif isinstance(content, str) and content:
-                    text_parts.append(content)
+                    assistant_parts.append(content)
 
             elif msg_type == "result":
                 result_text = obj.get("result", "")
-                if result_text:
-                    text_parts.append(result_text)
 
-        output = "\n".join(text_parts).strip()
+        output = (result_text or "\n".join(assistant_parts)).strip()
 
         if proc.returncode != 0 and not output:
             return BackendResult(
