@@ -103,6 +103,17 @@ class ClaudeCodeBackend(AgentBackend):
             duration_sec=duration,
         )
 
+    def build_interactive_cmd(
+        self,
+        prompt: str,
+        workspace: str,
+        session_id: str | None = None,
+    ) -> list[str]:
+        cmd = ["claude", prompt]
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        return cmd
+
     @classmethod
     def is_available(cls) -> bool:
         return shutil.which("claude") is not None

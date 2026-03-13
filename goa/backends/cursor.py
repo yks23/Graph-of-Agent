@@ -121,6 +121,23 @@ class CursorBackend(AgentBackend):
             duration_sec=duration,
         )
 
+    def build_interactive_cmd(
+        self,
+        prompt: str,
+        workspace: str,
+        session_id: str | None = None,
+    ) -> list[str]:
+        cmd = ["agent", prompt, "--trust"]
+
+        api_key = self._get_api_key()
+        if api_key:
+            cmd.extend(["--api-key", api_key])
+
+        if session_id:
+            cmd.extend(["--resume", session_id])
+
+        return cmd
+
     @classmethod
     def is_available(cls) -> bool:
         return shutil.which("agent") is not None

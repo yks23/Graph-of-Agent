@@ -18,7 +18,7 @@
 ### Step 2: 任务拆解
 将任务分析为多个独立的步骤，每个步骤对应一个图节点。原则：
 - 每个节点应有清晰、单一的职责
-- 节点间通过状态文件传递信息
+- 节点间通过 GOA_CALL 协议传递信息
 - 考虑错误处理路径
 
 ### Step 3: 节点设计
@@ -38,6 +38,18 @@
 | `cursor` | 需要读写文件、操作项目、使用 IDE 工具的任务 |
 | `codex` | 快速代码生成、简单的代码修改任务 |
 | `claude_code` | 复杂推理、长文档处理、需要深度分析的任务 |
+
+## GOA_CALL 协议
+
+每个节点执行完毕后，必须输出一个 GOA_CALL 块来激活下游节点。你在编写每个节点的 skill 时，不需要写 GOA_CALL 的使用说明——executor 会在运行时自动注入 Call 协议到 prompt 中。
+
+但你需要知道 GOA_CALL 的工作方式，以便设计合理的 transitions：
+
+- 节点通过输出 `GOA_CALL` 块来选择激活哪个下游节点
+- `condition` 必须精确匹配 transition 中声明的 condition
+- `data` 字段用于传递给下游节点的摘要信息
+- 一个节点可以有多条不同 condition 的转移边（如 done→reviewer, error→debugger）
+- 终端节点（无 transitions）输出空数组 `[]`
 
 ## 输出格式
 
@@ -63,6 +75,16 @@
 }
 ```
 
+## Skill 编写要点
+
+每个节点的 skill 应包含：
+1. 角色定义——告诉 agent 它是谁、负责什么
+2. 具体任务——清晰描述要做什么
+3. 输入来源——说明上游节点会通过 "Upstream Input" 传入什么数据
+4. 完成标准——什么情况下算完成、什么情况下算失败
+
+不需要在 skill 中写 GOA_CALL 说明（executor 自动注入），但要确保 skill 足够详细让 agent 能独立完成任务。
+
 ## 文件输出
 
 将生成的 graph.json 写入 `{workspace}/.goa/{graph_name}/graph.json`。
@@ -79,7 +101,7 @@
 analyzer → implementer → reviewer → merger
 ```
 
-### 带错误恢复
+### 带错误恢复（环状）
 ```
 implementer ──done──→ reviewer
 implementer ──error──→ debugger ──done──→ implementer
@@ -93,7 +115,7 @@ frontend_dev ──done──→ integrator
 backend_dev ──done──→ integrator
 ```
 
-### 迭代审查
+### 迭代审查（环状）
 ```
 implementer ──done──→ reviewer ──done──→ merger
                       reviewer ──error──→ implementer
@@ -102,6 +124,6 @@ implementer ──done──→ reviewer ──done──→ merger
 ## 注意事项
 
 - 每个节点的 Skill 应足够详细，使 Agent 能独立完成任务
-- Skill 中应说明如何获取上游节点的输出（通过传入的激活信息）
-- 考虑幂等性：节点可能被多次激活
+- 考虑幂等性：节点可能被多次激活（环状图中）
 - 保持图的简洁——通常 3-7 个节点足以覆盖大多数场景
+- 确保环状图有明确的退出条件，避免无限循环

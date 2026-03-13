@@ -72,6 +72,14 @@ class CodexBackend(AgentBackend):
             duration_sec=duration,
         )
 
+    def build_interactive_cmd(
+        self,
+        prompt: str,
+        workspace: str,
+        session_id: str | None = None,
+    ) -> list[str]:
+        return ["codex", prompt]
+
     @classmethod
     def is_available(cls) -> bool:
         return shutil.which("codex") is not None

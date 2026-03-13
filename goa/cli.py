@@ -182,17 +182,11 @@ def cmd_backends(args: argparse.Namespace) -> None:
     console.print(table)
 
 
-def cmd_construct(args: argparse.Namespace) -> None:
-    storage = _get_storage(args)
-    skill_path = Path(__file__).parent / "skills" / "constructor.md"
-    if not skill_path.exists():
-        console.print("[red]Constructor skill file not found.[/red]")
-        sys.exit(1)
-
-    skill_text = skill_path.read_text(encoding="utf-8")
-
-    backend_name = args.backend or "cursor"
+def _resolve_backend(args: argparse.Namespace, default: str = "cursor"):
+    """Resolve and validate a backend from CLI args."""
     from goa.backends import get_backend
+
+    backend_name = getattr(args, "backend", None) or default
     try:
         backend = get_backend(backend_name)
     except ValueError as e:
@@ -206,14 +200,95 @@ def cmd_construct(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    workspace = str(Path(getattr(args, "workspace", None) or ".").resolve())
-    console.print(f"[bold]Launching Constructor with '{backend_name}' backend...[/bold]")
-    result = backend.execute(skill_text, workspace)
-    if result.success:
-        console.print("[green]Constructor completed.[/green]")
-        console.print(result.output)
+    return backend
+
+
+def _resolve_workspace(args: argparse.Namespace) -> str:
+    return str(Path(getattr(args, "workspace", None) or ".").resolve())
+
+
+def _load_skill(name_or_path: str) -> str:
+    """Load a skill from built-in skills dir or a file path."""
+    builtin = Path(__file__).parent / "skills" / f"{name_or_path}.md"
+    if builtin.exists():
+        return builtin.read_text(encoding="utf-8")
+
+    builtin_no_ext = Path(__file__).parent / "skills" / name_or_path
+    if builtin_no_ext.exists():
+        return builtin_no_ext.read_text(encoding="utf-8")
+
+    path = Path(name_or_path)
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+
+    console.print(f"[red]Skill not found: '{name_or_path}'[/red]")
+    console.print("[dim]Looked in: built-in skills, file path[/dim]")
+    sys.exit(1)
+
+
+def cmd_construct(args: argparse.Namespace) -> None:
+    """Launch the Constructor skill as an interactive conversation."""
+    skill_text = _load_skill("constructor")
+    backend = _resolve_backend(args)
+    workspace = _resolve_workspace(args)
+
+    console.print(
+        f"[bold]GoA Constructor[/bold] — interactive graph builder "
+        f"(backend: {backend.name})"
+    )
+    console.print("[dim]Chat with the agent to design your graph. Ctrl+C to exit.[/dim]")
+    console.print()
+
+    session_id = getattr(args, "resume", None)
+    rc = backend.run_interactive(skill_text, workspace, session_id)
+    if rc == 0:
+        console.print("\n[green]Constructor session ended.[/green]")
     else:
-        console.print(f"[red]Constructor failed: {result.error}[/red]")
+        console.print(f"\n[yellow]Constructor exited with code {rc}[/yellow]")
+
+
+def cmd_chat(args: argparse.Namespace) -> None:
+    """Start an interactive conversation with a skill or graph node."""
+    backend = _resolve_backend(args)
+    workspace = _resolve_workspace(args)
+    storage = _get_storage(args)
+    session_id = args.resume
+
+    if args.node:
+        graph_name, node_name = args.node.split("/", 1) if "/" in args.node else (args.node, None)
+        if node_name is None:
+            console.print("[red]Usage: graph chat --node <graph>/<node>[/red]")
+            sys.exit(1)
+        try:
+            graph = storage.load_graph(graph_name)
+        except FileNotFoundError:
+            console.print(f"[red]Graph '{graph_name}' not found.[/red]")
+            sys.exit(1)
+        if node_name not in graph.nodes:
+            console.print(f"[red]Node '{node_name}' not in graph '{graph_name}'.[/red]")
+            sys.exit(1)
+        skill_text = graph.nodes[node_name].skill
+        console.print(
+            f"[bold]Chat: {graph_name}/{node_name}[/bold] "
+            f"(backend: {backend.name})"
+        )
+    elif args.skill:
+        skill_text = _load_skill(args.skill)
+        console.print(
+            f"[bold]Chat: {args.skill}[/bold] (backend: {backend.name})"
+        )
+    else:
+        skill_text = ""
+        console.print(f"[bold]Chat[/bold] (backend: {backend.name})")
+
+    console.print("[dim]Interactive session. Ctrl+C to exit.[/dim]")
+    console.print()
+
+    rc = backend.run_interactive(skill_text, workspace, session_id)
+    if rc == 0:
+        console.print("\n[green]Session ended.[/green]")
+    else:
+        console.print(f"\n[yellow]Exited with code {rc}[/yellow]")
 
 
 def cmd_import(args: argparse.Namespace) -> None:
@@ -307,6 +382,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_construct = sub.add_parser("construct", help="Launch Constructor (conversational graph builder)")
     p_construct.add_argument("--backend", default=None, help="Backend to use (default: cursor)")
+    p_construct.add_argument("--resume", default=None, help="Resume a previous session by ID")
+
+    p_chat = sub.add_parser("chat", help="Interactive conversation with a skill or graph node")
+    p_chat.add_argument("--skill", "-s", default=None, help="Built-in skill name or path to .md file")
+    p_chat.add_argument("--node", "-n", default=None, help="Graph node to chat as: <graph>/<node>")
+    p_chat.add_argument("--backend", default=None, help="Backend to use (default: cursor)")
+    p_chat.add_argument("--resume", default=None, help="Resume a previous session by ID")
 
     p_import = sub.add_parser("import", help="Import graph from JSON file")
     p_import.add_argument("file", help="Path to JSON file")
@@ -340,6 +422,7 @@ def main(argv: list[str] | None = None) -> None:
         "delete": cmd_delete,
         "backends": cmd_backends,
         "construct": cmd_construct,
+        "chat": cmd_chat,
         "import": cmd_import,
         "export": cmd_export,
         "serve": cmd_serve,
