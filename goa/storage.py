@@ -162,7 +162,8 @@ class GoAStorage:
         inbox = self._inbox_dir(graph_name, run_id, target_node)
         inbox.mkdir(parents=True, exist_ok=True)
         safe_ts = msg.timestamp.replace(":", "-").replace("+", "_")
-        filename = f"{safe_ts}_{msg.source}.json"
+        safe_source = msg.source.replace("/", "__").replace("\\", "__")
+        filename = f"{safe_ts}_{safe_source}.json"
         (inbox / filename).write_text(
             json.dumps(
                 {
@@ -206,6 +207,29 @@ class GoAStorage:
             f.unlink()
 
     # ------------------------------------------------------------------
+    # PID tracking (scanner lifecycle)
+    # ------------------------------------------------------------------
+
+    def write_pid(self, graph_name: str, run_id: str, pid: int) -> None:
+        path = self._run_dir(graph_name, run_id) / "pid"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(pid), encoding="utf-8")
+
+    def read_pid(self, graph_name: str, run_id: str) -> int | None:
+        path = self._run_dir(graph_name, run_id) / "pid"
+        if not path.exists():
+            return None
+        try:
+            return int(path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            return None
+
+    def clear_pid(self, graph_name: str, run_id: str) -> None:
+        path = self._run_dir(graph_name, run_id) / "pid"
+        if path.exists():
+            path.unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
     # Internal path helpers
     # ------------------------------------------------------------------
 
@@ -227,23 +251,27 @@ class GoAStorage:
 # ======================================================================
 
 def _graph_to_dict(g: Graph) -> dict:
+    nodes_dict = {}
+    for name, n in g.nodes.items():
+        nd: dict = {
+            "name": n.name,
+            "skill": n.skill,
+            "backend": n.backend,
+            "description": n.description,
+            "transitions": [
+                {"target": t.target, "condition": t.condition}
+                for t in n.transitions
+            ],
+        }
+        if n.subgraph:
+            nd["subgraph"] = n.subgraph
+        nodes_dict[name] = nd
+
     return {
         "name": g.name,
         "entry": g.entry,
         "description": g.description,
-        "nodes": {
-            name: {
-                "name": n.name,
-                "skill": n.skill,
-                "backend": n.backend,
-                "description": n.description,
-                "transitions": [
-                    {"target": t.target, "condition": t.condition}
-                    for t in n.transitions
-                ],
-            }
-            for name, n in g.nodes.items()
-        },
+        "nodes": nodes_dict,
     }
 
 
@@ -252,13 +280,14 @@ def _dict_to_graph(d: dict) -> Graph:
     for name, nd in d.get("nodes", {}).items():
         nodes[name] = GraphNode(
             name=nd["name"],
-            skill=nd["skill"],
-            backend=nd["backend"],
+            skill=nd.get("skill", ""),
+            backend=nd.get("backend", "cursor"),
             description=nd.get("description", ""),
             transitions=[
                 Transition(target=t["target"], condition=t.get("condition", "done"))
                 for t in nd.get("transitions", [])
             ],
+            subgraph=nd.get("subgraph"),
         )
     return Graph(
         name=d["name"],

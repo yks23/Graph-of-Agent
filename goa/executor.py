@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import signal
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 from goa.backends import get_backend
 from goa.models import (
@@ -86,7 +89,7 @@ class GoAExecutor:
         return run.run_id
 
     def stop(self, graph_name: str, run_id: str) -> None:
-        """Signal a running graph to stop."""
+        """Stop a running graph — works across processes."""
         key = f"{graph_name}/{run_id}"
         evt = self._stop_events.get(key)
         if evt:
@@ -99,6 +102,24 @@ class GoAExecutor:
         except FileNotFoundError:
             pass
 
+        pid = self.storage.read_pid(graph_name, run_id)
+        if pid and pid != os.getpid():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    def is_running(self, graph_name: str, run_id: str) -> bool:
+        """Check if a run's scanner process is alive."""
+        pid = self.storage.read_pid(graph_name, run_id)
+        if not pid:
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
     # ------------------------------------------------------------------
     # Core loop
     # ------------------------------------------------------------------
@@ -106,31 +127,47 @@ class GoAExecutor:
     def _run_loop(
         self, graph: Graph, run: GraphRun, stop_event: threading.Event
     ) -> None:
-        log.info("Run %s started for graph '%s'", run.run_id, graph.name)
+        self.storage.write_pid(graph.name, run.run_id, os.getpid())
+
+        log.info("Run %s started for graph '%s' (pid=%d)",
+                 run.run_id, graph.name, os.getpid())
         self.storage.append_log(
             graph.name, run.run_id, "_executor",
-            f"Run started — entry node: {graph.entry}",
+            f"Run started — entry: {graph.entry}, pid: {os.getpid()}",
         )
 
-        while not stop_event.is_set():
-            still_active = self._poll_cycle(graph, run)
-            if not still_active:
-                break
-            stop_event.wait(self.poll_interval)
+        try:
+            while not stop_event.is_set():
+                if self._check_stopped(graph.name, run.run_id):
+                    break
 
-        run = self.storage.load_run(graph.name, run.run_id)
-        if run.status == "running":
-            run.status = "completed"
-            self.storage.save_run(run)
+                still_active = self._poll_cycle(graph, run)
+                if not still_active:
+                    break
+                stop_event.wait(self.poll_interval)
+        finally:
+            run = self.storage.load_run(graph.name, run.run_id)
+            if run.status == "running":
+                run.status = "completed"
+                self.storage.save_run(run)
 
-        self.storage.append_log(
-            graph.name, run.run_id, "_executor",
-            f"Run finished with status: {run.status}",
-        )
-        log.info("Run %s finished — %s", run.run_id, run.status)
+            self.storage.append_log(
+                graph.name, run.run_id, "_executor",
+                f"Run finished — status: {run.status}",
+            )
+            self.storage.clear_pid(graph.name, run.run_id)
+            log.info("Run %s finished — %s", run.run_id, run.status)
 
-        key = f"{graph.name}/{run.run_id}"
-        self._stop_events.pop(key, None)
+            key = f"{graph.name}/{run.run_id}"
+            self._stop_events.pop(key, None)
+
+    def _check_stopped(self, graph_name: str, run_id: str) -> bool:
+        """Read run.json — if status != running, someone else stopped us."""
+        try:
+            run = self.storage.load_run(graph_name, run_id)
+            return run.status != "running"
+        except FileNotFoundError:
+            return True
 
     def _poll_cycle(self, graph: Graph, run: GraphRun) -> bool:
         self._process_inboxes(graph, run)
@@ -183,16 +220,27 @@ class GoAExecutor:
 
             self.storage.append_log(
                 graph.name, run.run_id, node_name,
-                f"PENDING — inbox consumed: {len(messages)} msg(s) "
-                f"from [{state.activated_by}]",
+                f"PENDING — inbox: {len(messages)} msg(s) from [{state.activated_by}]",
             )
 
     # ------------------------------------------------------------------
     # Node execution
     # ------------------------------------------------------------------
 
-    def _execute_node(self, graph: Graph, run: GraphRun, node_name: str) -> None:
+    def _execute_node(
+        self,
+        graph: Graph,
+        run: GraphRun,
+        node_name: str,
+        name_prefix: str = "",
+    ) -> None:
         node = graph.nodes[node_name]
+        display_name = f"{name_prefix}{node_name}" if name_prefix else node_name
+
+        if node.subgraph:
+            self._execute_subgraph(graph, run, node, display_name)
+            return
+
         state = self.storage.read_node_state(graph.name, run.run_id, node_name)
         backend = get_backend(node.backend)
 
@@ -201,7 +249,7 @@ class GoAExecutor:
         state.status = NodeStatus.RUNNING
         self.storage.write_node_state(graph.name, run.run_id, node_name, state)
         self.storage.append_log(
-            graph.name, run.run_id, node_name,
+            graph.name, run.run_id, display_name,
             f"RUNNING — backend={node.backend}",
         )
 
@@ -217,7 +265,7 @@ class GoAExecutor:
             state.error = result.error
             self.storage.write_node_state(graph.name, run.run_id, node_name, state)
             self.storage.append_log(
-                graph.name, run.run_id, node_name,
+                graph.name, run.run_id, display_name,
                 f"ERROR (backend failure): {result.error}",
             )
             return
@@ -225,12 +273,130 @@ class GoAExecutor:
         state.status = NodeStatus.DONE
         state.error = ""
         self.storage.append_log(
-            graph.name, run.run_id, node_name,
+            graph.name, run.run_id, display_name,
             f"DONE ({result.duration_sec:.1f}s)",
         )
         self.storage.write_node_state(graph.name, run.run_id, node_name, state)
 
         self._dispatch_calls(graph, run, node, state)
+
+    # ------------------------------------------------------------------
+    # Subgraph execution
+    # ------------------------------------------------------------------
+
+    def _execute_subgraph(
+        self,
+        parent_graph: Graph,
+        parent_run: GraphRun,
+        node: GraphNode,
+        display_name: str,
+    ) -> None:
+        """Run a subgraph inline as if it were a single node."""
+        state = self.storage.read_node_state(
+            parent_graph.name, parent_run.run_id, node.name
+        )
+
+        try:
+            sub_graph = self.storage.load_graph(node.subgraph)
+        except FileNotFoundError:
+            state.status = NodeStatus.ERROR
+            state.error = f"Subgraph '{node.subgraph}' not found"
+            self.storage.write_node_state(
+                parent_graph.name, parent_run.run_id, node.name, state
+            )
+            return
+
+        state.status = NodeStatus.RUNNING
+        self.storage.write_node_state(
+            parent_graph.name, parent_run.run_id, node.name, state
+        )
+        self.storage.append_log(
+            parent_graph.name, parent_run.run_id, display_name,
+            f"RUNNING subgraph '{node.subgraph}' ({len(sub_graph.nodes)} nodes)",
+        )
+
+        sub_executor = GoAExecutor(self.storage, self.poll_interval)
+
+        sub_run = self.storage.create_run(node.subgraph)
+        for sub_name in sub_graph.nodes:
+            sub_state = NodeState(status=NodeStatus.IDLE)
+            self.storage.write_node_state(
+                node.subgraph, sub_run.run_id, sub_name, sub_state
+            )
+
+        self.storage.drop_inbox_message(
+            node.subgraph,
+            sub_run.run_id,
+            sub_graph.entry,
+            InboxMessage(
+                source=f"{parent_graph.name}/{node.name}",
+                condition="start",
+                data=state.input_data,
+                timestamp=_now(),
+            ),
+        )
+        self.storage.save_run(sub_run)
+
+        stop_event = threading.Event()
+        sub_executor._run_loop(sub_graph, sub_run, stop_event)
+
+        sub_run = self.storage.load_run(node.subgraph, sub_run.run_id)
+
+        outputs: list[str] = []
+        for sub_name in sub_graph.nodes:
+            sub_state = self.storage.read_node_state(
+                node.subgraph, sub_run.run_id, sub_name
+            )
+            if sub_state.status == NodeStatus.DONE and sub_state.output:
+                if not sub_graph.nodes[sub_name].transitions:
+                    outputs.append(sub_state.output)
+
+        state.output = "\n\n".join(outputs) if outputs else f"Subgraph '{node.subgraph}' completed"
+        state.updated_at = _now()
+
+        if sub_run.status == "completed":
+            state.status = NodeStatus.DONE
+            state.error = ""
+            self.storage.append_log(
+                parent_graph.name, parent_run.run_id, display_name,
+                f"DONE — subgraph '{node.subgraph}' run {sub_run.run_id} completed",
+            )
+        else:
+            state.status = NodeStatus.ERROR
+            state.error = f"Subgraph ended with status: {sub_run.status}"
+            self.storage.append_log(
+                parent_graph.name, parent_run.run_id, display_name,
+                f"ERROR — subgraph '{node.subgraph}' run {sub_run.run_id}: {sub_run.status}",
+            )
+
+        self.storage.write_node_state(
+            parent_graph.name, parent_run.run_id, node.name, state
+        )
+
+        if state.status == NodeStatus.DONE:
+            condition = "done"
+        elif state.status == NodeStatus.ERROR:
+            condition = "error"
+        else:
+            return
+
+        for t in node.transitions:
+            if t.condition != condition:
+                continue
+            msg = InboxMessage(
+                source=node.name,
+                condition=condition,
+                data=state.output,
+                timestamp=_now(),
+            )
+            self.storage.drop_inbox_message(
+                parent_graph.name, parent_run.run_id, t.target, msg
+            )
+            self.storage.append_log(
+                parent_graph.name, parent_run.run_id, t.target,
+                f"INBOX ← from '{display_name}' "
+                f"(subgraph {condition}, {len(state.output)} chars)",
+            )
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -260,10 +426,8 @@ class GoAExecutor:
     ) -> str:
         sections: list[str] = []
 
-        # 1. Skill
         sections.append(node.skill)
 
-        # 2. Workspace
         sections.append(
             f"## Workspace\n"
             f"- Working directory: {workspace}\n"
@@ -273,7 +437,6 @@ class GoAExecutor:
             f"- Node: {node.name} (backend: {node.backend})"
         )
 
-        # 3. Workflow
         workflow_lines = ["## Workflow"]
         workflow_lines.append(f"Graph \"{graph.name}\": {graph.description}")
         workflow_lines.append(f"Entry node: {graph.entry}")
@@ -281,14 +444,14 @@ class GoAExecutor:
         workflow_lines.append("Nodes in this graph:")
         for n_name, n in graph.nodes.items():
             marker = " ← YOU" if n_name == node.name else ""
-            workflow_lines.append(
-                f"  [{n_name}] ({n.backend}) — {n.description or n.skill[:60]}{marker}"
-            )
+            label = n.description or n.skill[:60]
+            if n.subgraph:
+                label = f"[subgraph: {n.subgraph}] {label}"
+            workflow_lines.append(f"  [{n_name}] ({n.backend}) — {label}{marker}")
             for t in n.transitions:
                 workflow_lines.append(f"    ──{t.condition}──> {t.target}")
         sections.append("\n".join(workflow_lines))
 
-        # 4. Upstream input
         if state.input_data:
             sections.append(
                 f"## Upstream Input\n"
@@ -296,10 +459,7 @@ class GoAExecutor:
                 f"Data:\n{state.input_data}"
             )
 
-        # 5. Call
         sections.append(self._build_call_section(node))
-
-        # 6. Constraints
         sections.append(self._build_constraints_section(node))
 
         return "\n\n".join(sections)
@@ -402,7 +562,6 @@ class GoAExecutor:
         node: GraphNode,
         state: NodeState,
     ) -> None:
-        """Parse GOA_CALL from output. Strict: must exist, must match graph."""
         calls = _parse_goa_calls(state.output)
 
         if not node.transitions:
@@ -416,8 +575,7 @@ class GoAExecutor:
         if not calls:
             self.storage.append_log(
                 graph.name, run.run_id, node.name,
-                "ERROR: no GOA_CALL block found in output — "
-                "node has transitions but agent did not emit a call",
+                "ERROR: no GOA_CALL block in output",
             )
             state.status = NodeStatus.ERROR
             state.error = "No GOA_CALL block in output"
@@ -426,9 +584,7 @@ class GoAExecutor:
             )
             return
 
-        valid_edges: dict[str, str] = {
-            (t.target, t.condition): True for t in node.transitions
-        }
+        valid_edges = {(t.target, t.condition) for t in node.transitions}
         valid_targets = {t.target for t in node.transitions}
 
         for call in calls:
@@ -439,19 +595,16 @@ class GoAExecutor:
             if target not in valid_targets:
                 self.storage.append_log(
                     graph.name, run.run_id, node.name,
-                    f"CALL rejected: target '{target}' is not in "
-                    f"declared transitions {sorted(valid_targets)}",
+                    f"CALL rejected: target '{target}' not in {sorted(valid_targets)}",
                 )
                 continue
 
             if (target, condition) not in valid_edges:
-                valid_conditions = [
-                    t.condition for t in node.transitions if t.target == target
-                ]
+                valid_conds = [t.condition for t in node.transitions if t.target == target]
                 self.storage.append_log(
                     graph.name, run.run_id, node.name,
-                    f"CALL rejected: edge ({target}, {condition}) does not exist. "
-                    f"Valid conditions for '{target}': {valid_conditions}",
+                    f"CALL rejected: ({target}, {condition}) not declared. "
+                    f"Valid for '{target}': {valid_conds}",
                 )
                 continue
 
@@ -482,7 +635,6 @@ _GOA_CALL_PATTERN = re.compile(
 
 
 def _parse_goa_calls(output: str) -> list[dict]:
-    """Extract GOA_CALL JSON blocks from agent output."""
     matches = _GOA_CALL_PATTERN.findall(output)
     if not matches:
         return []

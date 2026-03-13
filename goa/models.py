@@ -20,13 +20,14 @@ class Transition:
 
 @dataclass
 class GraphNode:
-    """A single node in the graph = one agent invocation."""
+    """A single node in the graph = one agent invocation or subgraph."""
 
     name: str
     skill: str
     backend: str
     transitions: list[Transition] = field(default_factory=list)
     description: str = ""
+    subgraph: str | None = None
 
 
 @dataclass

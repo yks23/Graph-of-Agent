@@ -53,7 +53,8 @@ def cmd_show(args: argparse.Namespace) -> None:
     tree = Tree(f"[bold]{g.name}[/bold]  [dim]{g.description}[/dim]")
     for name, node in g.nodes.items():
         prefix = "[bold green][entry][/bold green] " if name == g.entry else ""
-        branch = tree.add(f"{prefix}{name} [dim]({node.backend})[/dim]")
+        sub_tag = f" [magenta][sub:{node.subgraph}][/magenta]" if node.subgraph else ""
+        branch = tree.add(f"{prefix}{name} [dim]({node.backend})[/dim]{sub_tag}")
         if node.description:
             branch.add(f"[dim]{node.description}[/dim]")
         for t in node.transitions:
