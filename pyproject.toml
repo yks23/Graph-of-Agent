@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goa"
+version = "0.1.0"
+description = "GoA (Graph of Agents) — orchestrate multiple AI agents as a directed graph"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.0",
+]
+
+[project.scripts]
+graph = "goa.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["goa*"]
